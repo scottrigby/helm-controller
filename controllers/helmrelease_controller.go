@@ -442,7 +442,10 @@ func (r *HelmReleaseReconciler) checkDependencies(hr v2.HelmRelease) error {
 		if d.Namespace == "" {
 			d.Namespace = hr.GetNamespace()
 		}
-		dName := types.NamespacedName(d)
+		dName := types.NamespacedName{
+			Namespace: d.Namespace,
+			Name:      d.Name,
+		}
 		var dHr v2.HelmRelease
 		err := r.Get(context.Background(), dName, &dHr)
 		if err != nil {
