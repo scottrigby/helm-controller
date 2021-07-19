@@ -83,4 +83,8 @@ const (
 	// GetLastReleaseFailedReason represents the fact that observing the last
 	// release failed.
 	GetLastReleaseFailedReason string = "GetLastReleaseFailed"
+
+	// DependencyNotReadyReason represents the fact that one of the toolkit resource
+	// dependencies is not ready.
+	DependencyNotReadyReason string = "DependencyNotReady"
 )
