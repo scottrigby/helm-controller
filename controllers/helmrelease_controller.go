@@ -442,6 +442,7 @@ func (r *HelmReleaseReconciler) checkDependencies(hr v2.HelmRelease) error {
 		if d.Namespace == "" {
 			d.Namespace = hr.GetNamespace()
 		}
+		// TODO: should support re-assignment from meta.NamespacedObjectReference
 		dName := types.NamespacedName{
 			Namespace: d.Namespace,
 			Name:      d.Name,
