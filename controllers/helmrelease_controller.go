@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/fluxcd/pkg/apis/meta"
+	"github.com/fluxcd/pkg/runtime/conditions"
 	"github.com/fluxcd/pkg/runtime/events"
 	"github.com/fluxcd/pkg/runtime/metrics"
 	"github.com/fluxcd/pkg/runtime/predicates"
@@ -192,7 +193,7 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 	// Observe HelmRelease generation.
 	if hr.Status.ObservedGeneration != hr.Generation {
 		hr.Status.ObservedGeneration = hr.Generation
-		hr = v2.HelmReleaseProgressing(hr)
+		conditions.MarkUnknown(&hr, meta.ReadyCondition, meta.ProgressingReason, "Reconiliation in progress")
 		if updateStatusErr := r.patchStatus(ctx, &hr); updateStatusErr != nil {
 			log.Error(updateStatusErr, "unable to update status after generation update")
 			return hr, ctrl.Result{Requeue: true}, updateStatusErr
@@ -215,7 +216,8 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 	if reconcileErr != nil {
 		msg := fmt.Sprintf("chart reconciliation failed: %s", reconcileErr.Error())
 		r.event(ctx, hr, hr.Status.LastAttemptedRevision, events.EventSeverityError, msg)
-		return v2.HelmReleaseNotReady(hr, v2.ArtifactFailedReason, msg), ctrl.Result{Requeue: true}, reconcileErr
+		conditions.MarkFalse(&hr, meta.ReadyCondition, v2.ArtifactFailedReason, msg)
+		return hr, ctrl.Result{Requeue: true}, reconcileErr
 	}
 
 	// Check chart readiness
@@ -225,7 +227,8 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 		log.Info(msg)
 		// Do not requeue immediately, when the artifact is created
 		// the watcher should trigger a reconciliation.
-		return v2.HelmReleaseNotReady(hr, v2.ArtifactFailedReason, msg), ctrl.Result{RequeueAfter: hc.Spec.Interval.Duration}, nil
+		conditions.MarkFalse(&hr, meta.ReadyCondition, v2.ArtifactFailedReason, msg)
+		return hr, ctrl.Result{RequeueAfter: hc.Spec.Interval.Duration}, nil
 	}
 
 	// Check dependencies
@@ -238,8 +241,8 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 
 			// Exponential backoff would cause execution to be prolonged too much,
 			// instead we requeue on a fixed interval.
-			return v2.HelmReleaseNotReady(hr,
-				meta.DependencyNotReadyReason, err.Error()), ctrl.Result{RequeueAfter: r.requeueDependency}, nil
+			conditions.MarkFalse(&hr, meta.ReadyCondition, v2.DependencyNotReadyReason, err.Error())
+			return hr, ctrl.Result{RequeueAfter: r.requeueDependency}, nil
 		}
 		log.Info("all dependencies are ready, proceeding with release")
 	}
@@ -248,14 +251,16 @@ func (r *HelmReleaseReconciler) reconcile(ctx context.Context, hr v2.HelmRelease
 	values, err := r.composeValues(ctx, hr)
 	if err != nil {
 		r.event(ctx, hr, hr.Status.LastAttemptedRevision, events.EventSeverityError, err.Error())
-		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, err.Error()), ctrl.Result{Requeue: true}, nil
+		conditions.MarkFalse(&hr, meta.ReadyCondition, v2.InitFailedReason, err.Error())
+		return hr, ctrl.Result{Requeue: true}, nil
 	}
 
 	// Load chart from artifact
 	chart, err := r.loadHelmChart(hc)
 	if err != nil {
 		r.event(ctx, hr, hr.Status.LastAttemptedRevision, events.EventSeverityError, err.Error())
-		return v2.HelmReleaseNotReady(hr, v2.ArtifactFailedReason, err.Error()), ctrl.Result{Requeue: true}, nil
+		conditions.MarkFalse(&hr, meta.ReadyCondition, v2.ArtifactFailedReason, err.Error())
+		return hr, ctrl.Result{Requeue: true}, nil
 	}
 
 	// Reconcile Helm release
@@ -280,18 +285,21 @@ func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context,
 	// Initialize Helm action runner
 	getter, err := r.getRESTClientGetter(ctx, hr)
 	if err != nil {
-		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, err.Error()), err
+		conditions.MarkFalse(&hr, meta.ReadyCondition, v2.InitFailedReason, err.Error())
+		return hr, err
 	}
 	run, err := runner.NewRunner(getter, hr.GetStorageNamespace(), log)
 	if err != nil {
-		return v2.HelmReleaseNotReady(hr, v2.InitFailedReason, "failed to initialize Helm action runner"), err
+		conditions.MarkFalse(&hr, meta.ReadyCondition, v2.InitFailedReason, err.Error())
+		return hr, err
 	}
 
 	// Determine last release revision.
 	rel, observeLastReleaseErr := run.ObserveLastRelease(hr)
 	if observeLastReleaseErr != nil {
 		err = fmt.Errorf("failed to get last release revision: %w", observeLastReleaseErr)
-		return v2.HelmReleaseNotReady(hr, v2.GetLastReleaseFailedReason, "failed to get last release revision"), err
+		conditions.MarkFalse(&hr, meta.ReadyCondition, v2.GetLastReleaseFailedReason, "failed to get last release revision")
+		return hr, err
 	}
 
 	// Register the current release attempt.
@@ -300,7 +308,7 @@ func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context,
 	valuesChecksum := util.ValuesChecksum(values)
 	hr, hasNewState := v2.HelmReleaseAttempted(hr, revision, releaseRevision, valuesChecksum)
 	if hasNewState {
-		hr = v2.HelmReleaseProgressing(hr)
+		conditions.MarkUnknown(&hr, meta.ReadyCondition, meta.ProgressingReason, "Reconciliation in progress")
 		if updateStatusErr := r.patchStatus(ctx, &hr); updateStatusErr != nil {
 			log.Error(updateStatusErr, "unable to update status after state update")
 			return hr, updateStatusErr
@@ -315,27 +323,31 @@ func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context,
 		switch released.Status {
 		// Succeed if the previous release attempt succeeded.
 		case metav1.ConditionTrue:
-			return v2.HelmReleaseReady(hr), nil
+			conditions.MarkTrue(&hr, meta.ReadyCondition, meta.SucceededReason, "Release reconciliation succeeded")
+			return hr, nil
 		case metav1.ConditionFalse:
 			// Fail if the previous release attempt remediation failed.
 			remediated := apimeta.FindStatusCondition(hr.Status.Conditions, v2.RemediatedCondition)
 			if remediated != nil && remediated.Status == metav1.ConditionFalse {
 				err = fmt.Errorf("previous release attempt remediation failed")
-				return v2.HelmReleaseNotReady(hr, remediated.Reason, remediated.Message), err
+				conditions.MarkFalse(&hr, meta.ReadyCondition, remediated.Reason, remediated.Message)
+				return hr, err
 			}
 		}
 
 		// Fail if install retries are exhausted.
 		if hr.Spec.GetInstall().GetRemediation().RetriesExhausted(hr) {
 			err = fmt.Errorf("install retries exhausted")
-			return v2.HelmReleaseNotReady(hr, released.Reason, err.Error()), err
+			conditions.MarkFalse(&hr, meta.ReadyCondition, released.Reason, err.Error())
+			return hr, err
 		}
 
 		// Fail if there is a release and upgrade retries are exhausted.
 		// This avoids failing after an upgrade uninstall remediation strategy.
 		if rel != nil && hr.Spec.GetUpgrade().GetRemediation().RetriesExhausted(hr) {
 			err = fmt.Errorf("upgrade retries exhausted")
-			return v2.HelmReleaseNotReady(hr, released.Reason, err.Error()), err
+			conditions.MarkFalse(&hr, meta.ReadyCondition, released.Reason, err.Error())
+			return hr, err
 		}
 	}
 
@@ -370,7 +382,7 @@ func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context,
 			// Propagate any test error if not marked ignored.
 			if testErr != nil && !remediation.MustIgnoreTestFailures(hr.Spec.GetTest().IgnoreFailures) {
 				testsPassing := apimeta.FindStatusCondition(hr.Status.Conditions, v2.TestSuccessCondition)
-				meta.SetResourceCondition(&hr, v2.ReleasedCondition, metav1.ConditionFalse, testsPassing.Reason, testsPassing.Message)
+				conditions.MarkFalse(&hr, v2.ReleasedCondition, testsPassing.Reason, testsPassing.Message)
 				err = testErr
 			}
 		}
@@ -414,13 +426,15 @@ func (r *HelmReleaseReconciler) reconcileRelease(ctx context.Context,
 	hr.Status.LastReleaseRevision = util.ReleaseRevision(rel)
 
 	if err != nil {
-		reason := meta.ReconciliationFailedReason
+		reason := meta.FailedReason
 		if condErr := (*ConditionError)(nil); errors.As(err, &condErr) {
 			reason = condErr.Reason
 		}
-		return v2.HelmReleaseNotReady(hr, reason, err.Error()), err
+		conditions.MarkFalse(&hr, meta.ReadyCondition, reason, err.Error())
+		return hr, err
 	}
-	return v2.HelmReleaseReady(hr), nil
+	conditions.MarkTrue(&hr, meta.ReadyCondition, meta.SucceededReason, "Release reconciliation succeeded")
+	return hr, nil
 }
 
 func (r *HelmReleaseReconciler) checkDependencies(hr v2.HelmRelease) error {
@@ -666,12 +680,12 @@ func (r *HelmReleaseReconciler) handleHelmActionResult(ctx context.Context,
 		if actionErr := (*runner.ActionError)(nil); errors.As(err, &actionErr) {
 			msg = msg + "\n\nLast Helm logs:\n\n" + actionErr.CapturedLogs
 		}
-		meta.SetResourceCondition(hr, condition, metav1.ConditionFalse, failedReason, msg)
+		conditions.MarkFalse(hr, condition, failedReason, msg)
 		r.event(ctx, *hr, revision, events.EventSeverityError, msg)
 		return &ConditionError{Reason: failedReason, Err: err}
 	} else {
 		msg := fmt.Sprintf("Helm %s succeeded", action)
-		meta.SetResourceCondition(hr, condition, metav1.ConditionTrue, succeededReason, msg)
+		conditions.MarkTrue(hr, condition, succeededReason, msg)
 		r.event(ctx, *hr, revision, events.EventSeverityInfo, msg)
 		return nil
 	}
